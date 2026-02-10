@@ -1,0 +1,421 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8" />
+<title>A4 Screenshot Editor (Querformat)</title>
+<link href="https://unpkg.com/cropperjs@1.6.1/dist/cropper.min.css" rel="stylesheet" />
+<style>
+body{margin:0;font-family:system-ui,sans-serif;background:#f0f0f0;}
+#toolbar{position:sticky;top:0;background:#222;color:#fff;padding:8px;display:flex;gap:10px;align-items:center;z-index:10}
+button,input{cursor:pointer}
+#viewport{overflow:auto}
+#pages{padding:20px;display:flex;flex-direction:column;gap:30px;align-items:center;transform-origin:top center}
+.page{position:relative;width:1123px;height:794px;background:white;box-shadow:0 0 10px rgba(0,0,0,.2);overflow:hidden}
+.page.active{outline:4px solid #4da3ff}
+.page .guide{position:absolute;top:0;bottom:0;left:50%;width:0;border-left:2px dashed rgba(77,163,255,.8);pointer-events:none}
+.item{position:absolute;cursor:move;transform-origin:center center}
+.item.selected{outline:2px dashed #4da3ff}
+.item img{display:block;width:100%;height:100%;user-select:none;pointer-events:none}
+.resize-handle{position:absolute;width:10px;height:10px;background:#4da3ff;border-radius:50%;z-index:5}
+.resize-handle.br{right:-5px;bottom:-5px;cursor:se-resize}
+.resize-handle.bl{left:-5px;bottom:-5px;cursor:sw-resize}
+.resize-handle.tr{right:-5px;top:-5px;cursor:ne-resize}
+.resize-handle.tl{left:-5px;top:-5px;cursor:nw-resize}
+#cropOverlay{position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;align-items:center;justify-content:center;z-index:1000}
+#cropBox{background:white;padding:10px}
+.zoom-label{white-space:nowrap}
+
+#contextMenu{
+    position:fixed;
+    background:#fff;
+    border:1px solid #ccc;
+    box-shadow:0 4px 12px rgba(0,0,0,.2);
+    display:none;
+    z-index:2000;
+    min-width:140px;
+}
+#contextMenu button{
+    width:100%;
+    border:0;
+    background:none;
+    padding:8px 12px;
+    text-align:left;
+}
+#contextMenu button:hover{background:#eee}
+</style>
+</head>
+<body>
+
+<div id="toolbar">
+    <button id="addPageBtn">Seite hinzufügen</button>
+    <button id="cropBtn">Ausgewähltes Bild zuschneiden</button>
+    <button id="rotateBtn">↻ 90° drehen</button>
+    <button id="downloadBtn">Als PDF herunterladen</button>
+
+    <span class="zoom-label">Zoom:</span>
+    <input id="zoomRange" type="range" min="25" max="200" value="100" />
+    <span id="zoomValue">100%</span>
+
+    <input type="file" id="fileInput" accept="image/*" multiple>
+
+    <span style="margin-left:auto">Bilder auswählen oder auf die Seite ziehen</span>
+</div>
+
+<div id="viewport">
+    <div id="pages"></div>
+</div>
+
+<div id="cropOverlay">
+    <div id="cropBox">
+        <div style="max-width:90vw;max-height:80vh;">
+            <img id="cropImage" style="max-width:100%;" />
+        </div>
+        <div style="margin-top:10px; text-align:right;">
+            <button id="applyCrop">Zuschneiden</button>
+            <button id="cancelCrop">Abbrechen</button>
+        </div>
+    </div>
+</div>
+
+<div id="contextMenu" data-html2canvas-ignore="true">
+    <button id="deleteItemBtn">Löschen</button>
+</div>
+
+<script src="https://unpkg.com/cropperjs@1.6.1/dist/cropper.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+
+<script>
+const pagesEl = document.getElementById('pages');
+let activePage = null;
+let selectedItem = null;
+let cropper = null;
+
+const fileInput = document.getElementById('fileInput');
+
+// ---------------- Seiten ----------------
+function createPage(){
+    const p = document.createElement('div');
+    p.className = 'page';
+
+    const guide = document.createElement('div');
+    guide.className = 'guide';
+    guide.setAttribute('data-html2canvas-ignore','true');
+    p.appendChild(guide);
+
+    p.addEventListener('mousedown',()=>setActivePage(p));
+    pagesEl.appendChild(p);
+    setActivePage(p);
+}
+
+function setActivePage(p){
+    document.querySelectorAll('.page').forEach(pg=>pg.classList.remove('active'));
+    p.classList.add('active');
+    activePage = p;
+}
+
+createPage();
+
+// ---------------- Zoom ----------------
+const zoomRange = document.getElementById('zoomRange');
+const zoomValue = document.getElementById('zoomValue');
+
+function applyZoom(){
+    const z = zoomRange.value / 100;
+    pagesEl.style.transform = `scale(${z})`;
+    zoomValue.textContent = zoomRange.value + '%';
+}
+zoomRange.addEventListener('input', applyZoom);
+applyZoom();
+
+// ---------------- Bilder einfügen (Datei) ----------------
+fileInput.addEventListener('change', () => {
+    if(!activePage) return;
+
+    for(const file of fileInput.files){
+        if(!file.type.startsWith('image/')) continue;
+
+        const url = URL.createObjectURL(file);
+        addImageToPage(url);
+    }
+
+    fileInput.value = '';
+});
+
+// ---------------- Drag & Drop ----------------
+document.addEventListener('dragover', e => e.preventDefault());
+
+document.addEventListener('drop', e => {
+    e.preventDefault();
+
+    if(!activePage) return;
+
+    for(const file of e.dataTransfer.files){
+        if(!file.type.startsWith('image/')) continue;
+
+        const url = URL.createObjectURL(file);
+        addImageToPage(url);
+    }
+});
+
+// ---------------- Bild hinzufügen ----------------
+function addImageToPage(src){
+    const wrapper = document.createElement('div');
+    wrapper.className = 'item';
+    wrapper.style.left = '100px';
+    wrapper.style.top  = '100px';
+    wrapper.dataset.rotation = '0';
+
+    const img = document.createElement('img');
+    img.src = src;
+
+    wrapper.appendChild(img);
+    addResizeHandles(wrapper);
+    makeDraggable(wrapper);
+
+    img.onload = ()=>{
+        const w = Math.min(300, img.naturalWidth);
+        const h = img.naturalHeight * (w / img.naturalWidth);
+        wrapper.style.width  = w + 'px';
+        wrapper.style.height = h + 'px';
+    };
+
+    wrapper.addEventListener('mousedown',(e)=>{
+        e.stopPropagation();
+        selectItem(wrapper);
+    });
+
+    wrapper.addEventListener('contextmenu',(e)=>{
+        e.preventDefault();
+        selectItem(wrapper);
+        showContextMenu(e.clientX, e.clientY);
+    });
+
+    activePage.appendChild(wrapper);
+    selectItem(wrapper);
+}
+
+// ---------------- Auswahl ----------------
+function selectItem(el){
+    document.querySelectorAll('.item').forEach(i=>i.classList.remove('selected'));
+    selectedItem = el;
+    if(el) el.classList.add('selected');
+}
+
+// ---------------- Drag ----------------
+function makeDraggable(el){
+    let startX, startY, startLeft, startTop;
+
+    el.addEventListener('pointerdown',(e)=>{
+        if(e.target.classList.contains('resize-handle')) return;
+
+        el.setPointerCapture(e.pointerId);
+
+        startX = e.clientX;
+        startY = e.clientY;
+        startLeft = parseFloat(el.style.left);
+        startTop  = parseFloat(el.style.top);
+
+        function move(ev){
+            const dx = ev.clientX - startX;
+            const dy = ev.clientY - startY;
+            el.style.left = startLeft + dx + 'px';
+            el.style.top  = startTop  + dy + 'px';
+        }
+
+        function up(){
+            window.removeEventListener('pointermove',move);
+            window.removeEventListener('pointerup',up);
+        }
+
+        window.addEventListener('pointermove',move);
+        window.addEventListener('pointerup',up);
+    });
+}
+
+// ---------------- Resize ----------------
+function addResizeHandles(el){
+    ['br','bl','tr','tl'].forEach(pos=>{
+        const h = document.createElement('div');
+        h.className = 'resize-handle ' + pos;
+        el.appendChild(h);
+        makeResizable(el, h, pos);
+    });
+}
+
+function makeResizable(el, handle, pos){
+    handle.addEventListener('pointerdown',(e)=>{
+        e.stopPropagation();
+
+        const startX = e.clientX;
+        const startW = el.offsetWidth;
+        const startH = el.offsetHeight;
+        const startL = parseFloat(el.style.left);
+        const startT = parseFloat(el.style.top);
+
+        const ratio = startW / startH;
+
+        function move(ev){
+            let dx = ev.clientX - startX;
+
+            let newW = startW;
+            let newH = startH;
+            let newL = startL;
+            let newT = startT;
+
+            if(pos.includes('r')) newW = startW + dx;
+            if(pos.includes('l')){
+                newW = startW - dx;
+                newL = startL + dx;
+            }
+
+            newH = newW / ratio;
+
+            if(pos.includes('t')){
+                newT = startT + (startH - newH);
+            }
+
+            if(newW < 20 || newH < 20) return;
+
+            el.style.width  = newW + 'px';
+            el.style.height = newH + 'px';
+            el.style.left   = newL + 'px';
+            el.style.top    = newT + 'px';
+        }
+
+        function up(){
+            window.removeEventListener('pointermove',move);
+            window.removeEventListener('pointerup',up);
+        }
+
+        window.addEventListener('pointermove',move);
+        window.addEventListener('pointerup',up);
+    });
+}
+
+// ---------------- Drehen ----------------
+rotateBtn.addEventListener('click',()=>{
+    if(!selectedItem) return alert('Kein Bild ausgewählt');
+
+    let r = parseInt(selectedItem.dataset.rotation || '0',10);
+    r = (r + 90) % 360;
+    selectedItem.dataset.rotation = r;
+    selectedItem.style.transform = `rotate(${r}deg)`;
+});
+
+// ---------------- Zuschneiden ----------------
+const cropOverlay = document.getElementById('cropOverlay');
+const cropImage   = document.getElementById('cropImage');
+
+cropBtn.addEventListener('click',()=>{
+    if(!selectedItem) return alert('Kein Bild ausgewählt');
+
+    const img = selectedItem.querySelector('img');
+    cropImage.src = img.src;
+    cropOverlay.style.display = 'flex';
+
+    cropImage.onload = ()=>{
+        cropper = new Cropper(cropImage,{viewMode:1,autoCropArea:1});
+    };
+});
+
+applyCrop.onclick = ()=>{
+    if(!cropper) return;
+
+    const canvas = cropper.getCroppedCanvas();
+    const img = selectedItem.querySelector('img');
+    img.src = canvas.toDataURL('image/png');
+
+    const ratio = canvas.width / canvas.height;
+    const h = selectedItem.offsetHeight;
+    selectedItem.style.width = h * ratio + 'px';
+
+    closeCrop();
+};
+
+cancelCrop.onclick = closeCrop;
+
+function closeCrop(){
+    if(cropper){ cropper.destroy(); cropper=null; }
+    cropOverlay.style.display='none';
+}
+
+// ---------------- Löschen ----------------
+function deleteSelected(){
+    if(!selectedItem) return;
+    selectedItem.remove();
+    selectedItem = null;
+}
+
+document.addEventListener('keydown',(e)=>{
+    if(!selectedItem) return;
+
+    if(e.key === 'Delete' || e.key === 'Backspace'){
+        e.preventDefault();
+        deleteSelected();
+        hideContextMenu();
+    }
+});
+
+// ---------------- Kontextmenü ----------------
+const contextMenu = document.getElementById('contextMenu');
+const deleteItemBtn = document.getElementById('deleteItemBtn');
+
+function showContextMenu(x,y){
+    contextMenu.style.left = x + 'px';
+    contextMenu.style.top  = y + 'px';
+    contextMenu.style.display = 'block';
+}
+
+function hideContextMenu(){
+    contextMenu.style.display = 'none';
+}
+
+deleteItemBtn.addEventListener('click',()=>{
+    deleteSelected();
+    hideContextMenu();
+});
+
+window.addEventListener('mousedown',()=>hideContextMenu());
+
+// ---------------- Seiten ----------------
+addPageBtn.addEventListener('click',createPage);
+
+pagesEl.addEventListener('mousedown',()=>selectItem(null));
+
+// ---------------- PDF ----------------
+downloadBtn.addEventListener('click', async ()=>{
+    const { jsPDF } = window.jspdf;
+    const pages = document.querySelectorAll('.page');
+
+    const oldTransform = pagesEl.style.transform;
+    pagesEl.style.transform = 'scale(1)';
+
+    const pdf = new jsPDF({
+        orientation:'landscape',
+        unit:'px',
+        format:[1123,794]
+    });
+
+    let first = true;
+
+    for(const p of pages){
+        const canvas = await html2canvas(p,{
+            backgroundColor:'#ffffff',
+            scale:2
+        });
+
+        const img = canvas.toDataURL('image/jpeg',1.0);
+
+        if(!first) pdf.addPage();
+        first = false;
+
+        pdf.addImage(img,'JPEG',0,0,1123,794);
+    }
+
+    pagesEl.style.transform = oldTransform;
+    pdf.save('screenshots-a4.pdf');
+});
+</script>
+</body>
+</html>
